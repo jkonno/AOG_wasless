@@ -8,37 +8,44 @@
   #include <Wire.h>
   #include "TinyGPS++.h"
   #include "BNO08x_AOG.h"
-  #define CMPS14_ADDRESS 0x60    // Address of CMPS14 shifted right one bit for arduino wire library
   #include <Kalman.h>
   using namespace BLA;
 
   // BNO08x definitions
-  #define REPORT_INTERVAL 20 //Report interval in ms (same as the delay at the bottom)
+  // Run filter at 100 Hz raw data, update orientation at 50 Hz
+  #define REPORT_INTERVAL 10 //Report interval in ms (same as the delay at the bottom)
   
   #define CONST_180_DIVIDED_BY_PI 57.2957795130823
+  #define CONST_PI 3.141592653589793
 
-  // Setup NMEA parsing stuff
+  // Setup NMEA parsing stuff with TinyGPS++ library
   TinyGPSPlus gps;
+  // Parse heading and speed from VTG
   TinyGPSCustom speedGPS(gps, "GNVTG", 7);
   TinyGPSCustom headingGPS(gps, "GNVTG", 1);
+  // Some aux variables
   double old_lat = 0.0;
   double old_lon = 0.0;
   double lat = 0.0;
   double lon = 0.0;
   double dist = 0.0;
   double heading = 0.0;
+  double wasAngle = 0.0;
 
   // Setup the Kalman filter variables
-
   #define Nstate 6 // heading, z-rate, z-bias, velocity, x-acc, x-bias
   #define Nobs 2   // heading, speed
   #define Ncom 1 // pitch rate
-
   BLA::Matrix<Nobs> obs; // observation vector
+  BLA::Matrix<Ncom> ctrl; // observation vector
   KALMAN<Nstate,Nobs,Ncom> K; // your Kalman filter
   unsigned long T; // current time
+  // Covariance tuning parameters
   double deltaT; // delay between two updates of the filter
-
+  double s2yaw = 0.49; // covariance for yaw, based on process noise 80m/s2 max accel.
+  double s2acc = 100000; // covariance for acceleration
+  double rGPS = 0.0001; //GPS meas covariance
+  double rIMU = 0.01; //IMU meas covariance
 
   //CMPS PGN - 211
   uint8_t data[] = {0x80,0x81,0x7D,0xD3,8, 0,0,0,0, 0,0,0,0, 15};
@@ -54,10 +61,10 @@
   uint8_t bno08xAddress;
   BNO080 bno08x;
 
-  float bno08xHeading = 0;
-  float yawRate = 0;
-  float pitchRate = 0;
-  float xAcc = 0;
+  double bno08xHeading = 0;
+  double yawRate = 0;
+  double pitchRate = 0;
+  double xAcc = 0;
   double bno08xRoll = 0;
   double bno08xPitch = 0;
 
@@ -74,82 +81,66 @@
 
     //test if CMPS working
     uint8_t error;
-    Serial.println("Checking for CMPS14");
-    Wire.beginTransmission(CMPS14_ADDRESS);
-    error = Wire.endTransmission();
-
-    if (error == 0)
+    for(int16_t i = 0; i < nrBNO08xAdresses; i++)
     {
-      Serial.println("Error = 0");
-      Serial.print("CMPS14 ADDRESs: 0x");
-      Serial.println(CMPS14_ADDRESS, HEX);
-      Serial.println("CMPS14 Ok.");
-      useCMPS = true;
-    }
-    else 
-    {
-      Serial.println("Error = 4");
-      Serial.println("CMPS not Connected or Found"); 
-    }
-
-    if(!useCMPS)
-    {
-      for(int16_t i = 0; i < nrBNO08xAdresses; i++)
-      {
-        bno08xAddress = bno08xAddresses[i];
-        
-        Serial.print("\r\nChecking for BNO08X on ");
-        Serial.println(bno08xAddress, HEX);
-        Wire.beginTransmission(bno08xAddress);
-        error = Wire.endTransmission();
+      bno08xAddress = bno08xAddresses[i];
+      
+      Serial.print("\r\nChecking for BNO08X on ");
+      Serial.println(bno08xAddress, HEX);
+      Wire.beginTransmission(bno08xAddress);
+      error = Wire.endTransmission();
     
-        if (error == 0)
+      if (error == 0)
+      {
+        Serial.println("Error = 0");
+        Serial.print("BNO08X ADDRESs: 0x");
+        Serial.println(bno08xAddress, HEX);
+        Serial.println("BNO08X Ok.");
+        Serial.println("");
+        Serial.println("Starting logging for following quantities:");
+        Serial.println("latitude,longitude,speed (km/h),heading_fix2fix (deg),heading_vtg (deg),heading_bno (deg),yaw_rate (deg/s),pitch_rate (deg/s),bno_roll (deg),bno_pitch (deg),x_acc (m/s2)");
+        // Initialize BNO080 lib        
+        if (bno08x.begin(bno08xAddress))
         {
-          Serial.println("Error = 0");
-          Serial.print("BNO08X ADDRESs: 0x");
-          Serial.println(bno08xAddress, HEX);
-          Serial.println("BNO08X Ok.");
-          Serial.println("");
-          Serial.println("Starting logging for following quantities:");
-          Serial.println("latitude,longitude,speed (km/h),heading_fix2fix (deg),heading_vtg (deg),heading_bno (deg),yaw_rate (deg/s),pitch_rate (deg/s),bno_roll (deg),bno_pitch (deg),x_acc (m/s2)");
-          // Initialize BNO080 lib        
-          if (bno08x.begin(bno08xAddress))
-          {
-            Wire.setClock(400000); //Increase I2C data rate to 400kHz
+          Wire.setClock(400000); //Increase I2C data rate to 400kHz
 
-            delay(100);
+          // Add bit of delay to make sure things are up...
+          delay(100);
             
-            // Use gameRotationVector
-            bno08x.enableGyro(REPORT_INTERVAL);
-            bno08x.enableGameRotationVector(REPORT_INTERVAL-1); //Send data update every REPORT_INTERVAL in ms for BNO085, looks like this cannot be identical to the other reports for it to work...
-            bno08x.enableAccelerometer(REPORT_INTERVAL);
-            delay(100);
-            // Retrieve the getFeatureResponse report to check if Rotation vector report is corectly enable
-            if (bno08x.getFeatureResponseAvailable() == true)
-            {
-              if (bno08x.checkReportEnable(SENSOR_REPORTID_GAME_ROTATION_VECTOR, REPORT_INTERVAL) == false) bno08x.printGetFeatureResponse();
-
-              // Break out of loop
-              useBNO08x = true;
-              break;
-            }
-            else 
-            {
-              Serial.println("BNO08x init fails!!");
-            }
-          }
-          else
+          // Enable raw gyro data at double rate
+          bno08x.enableGyro(REPORT_INTERVAL);
+          // Enable gameRotationVector mode
+          bno08x.enableGameRotationVector(2*REPORT_INTERVAL); //Send data update every REPORT_INTERVAL in ms for BNO085, looks like this cannot be identical to the other reports for it to work...
+          // Enable raw accelerometer
+          bno08x.enableAccelerometer(REPORT_INTERVAL);
+          delay(100);
+          // Retrieve the getFeatureResponse report to check if Rotation vector report is corectly enable
+          if (bno08x.getFeatureResponseAvailable() == true)
           {
-            Serial.println("BNO080 not detected at given I2C address.");
+            if (bno08x.checkReportEnable(SENSOR_REPORTID_GAME_ROTATION_VECTOR, REPORT_INTERVAL) == false) bno08x.printGetFeatureResponse();
+
+            // Break out of loop
+            useBNO08x = true;
+            break;
+          }
+          else 
+          {
+            Serial.println("BNO08x init fails!!");
           }
         }
-        else 
+        else
         {
-          Serial.println("Error = 4");
-          Serial.println("BNO08X not Connected or Found"); 
+          Serial.println("BNO080 not detected at given I2C address.");
         }
       }
+      else 
+      {
+        Serial.println("Error = 4");
+        Serial.println("BNO08X not Connected or Found"); 
+      }
     }
+
+    // Set initial time for timestep computations
     T = millis();
   }
   
@@ -159,47 +150,30 @@
     // TIME COMPUTATION
     deltaT = (millis()-T)/1000.0;
     T = millis();
-    
-    if(useCMPS)
-    {
-        Wire.beginTransmission(CMPS14_ADDRESS);  
-        Wire.write(0x02);                     
-        Wire.endTransmission();
-    
-        Wire.requestFrom(CMPS14_ADDRESS, 2); 
-        while(Wire.available() < 2);       
-  
-        //the heading x10
-        data[6] = Wire.read();
-        data[5] = Wire.read();
-   
-        Wire.beginTransmission(CMPS14_ADDRESS);  
-        Wire.write(0x1C);                    
-        Wire.endTransmission();
-   
-        Wire.requestFrom(CMPS14_ADDRESS, 2);  
-        while(Wire.available() < 2);        
-  
-        //the roll x10
-        data[8] = Wire.read();
-        data[7] = Wire.read();
-    } 
-    else if(useBNO08x)
+
+    if(useBNO08x)
     {
       if (bno08x.dataAvailable() == true)
       {
-        bno08xHeading = (bno08x.getYaw()) * CONST_180_DIVIDED_BY_PI; // Convert yaw / heading to degrees
-        bno08xHeading = -bno08xHeading; //BNO085 counter clockwise data to clockwise data
-        yawRate = (bno08x.getGyroZ()) * CONST_180_DIVIDED_BY_PI; // Get raw yaw rate
-        pitchRate = (bno08x.getGyroY()) * CONST_180_DIVIDED_BY_PI; // Get raw pitch rate
-        xAcc = (bno08x.getAccelX()); // Get x-acceleration for speed fusion
-        if (bno08xHeading < 0 && bno08xHeading >= -180) //Scale BNO085 yaw from [-180°;180°] to [0;360°]
+        // Stuff here is in the IMU coordinate frame!
+        bno08xHeading = bno08x.getYaw();                          // Heading in radian
+        bno08xHeading = -bno08xHeading;                           // BNO085 counter clockwise data to clockwise data
+        yawRate = bno08x.getGyroZ();                              // Get raw yaw rate in radian
+        pitchRate = bno08x.getGyroY();                            // Get raw pitch rate in radian
+        xAcc = bno08x.getAccelX();                                // Get x-acceleration for speed fusion
+        if (bno08xHeading < 0 && bno08xHeading >= -1.0*CONST_PI)  // Scale BNO085 yaw from [-180°;180°] to [0;360°]
         {
-          bno08xHeading = bno08xHeading + 360;
+          bno08xHeading = bno08xHeading + 2.0*CONST_PI;
         }
             
-        bno08xRoll = (bno08x.getRoll()) * CONST_180_DIVIDED_BY_PI; //Convert roll to degrees
-        bno08xPitch = (bno08x.getPitch())* CONST_180_DIVIDED_BY_PI; // Convert pitch to degrees
+        //bno08xRoll = (bno08x.getRoll()) * CONST_180_DIVIDED_BY_PI; //Convert roll to degrees
+        //bno08xPitch = (bno08x.getPitch())* CONST_180_DIVIDED_BY_PI; // Convert pitch to degrees
+
+        // Check for NaN so that the matrices don't get screwed up at start
+        if (isnan(bno08xRoll)) bno08xRoll = 0.0;
+        if (isnan(bno08xPitch)) bno08xPitch = 0.0;
+
+        // Stuff to be sent to AOG, modify later...
 
         bno08xHeading10x = (int16_t)(bno08xHeading * 10);
         bno08xRoll10x = (int16_t)(bno08xRoll * 10);
@@ -212,22 +186,36 @@
         data[7] = (uint8_t)bno08xRoll10x;
         data[8] = bno08xRoll10x >> 8;
 
-        // Build the Kalman filter matrices
+        // Run the Kalman filter starts here:
+        
+        // Build the Kalman filter matrices, different for each time step
+        
         // Process matrix
         K.F = {1.0,-deltaT*cos(bno08xRoll)/cos(bno08xPitch),0.0,0.0,0.0,0.0,
-                                             0.0,1.0,0.0,0.0,0.0,0.0,
+                                            0.0,1.0,0.0,0.0,0.0,0.0,
                                             0.0,0.0,1.0,0.0,0.0,0.0,
                                             0.0,0.0,0.0,1.0,deltaT,0.0,
                                             0.0,0.0,0.0,0.0,1,0.0,
                                             0.0,0.0,0.0,0.0,0.0,1.0};
+                                            
         // Control matrix
         K.B = {-deltaT*sin(bno08xRoll)/cos(bno08xPitch),0.0,0.0,0.0,0.0,0.0};
+        
+        // Model covariance matrix
+        K.Q = {s2yaw*pow(deltaT,4),s2yaw*pow(deltaT,3),0.0,0.0,0.0,0.0,
+               s2yaw*pow(deltaT,3),s2yaw*pow(deltaT,2),0.0,0.0,0.0,0.0,
+               0.0,0.0,1.0E-12,0.0,0.0,0.0,
+               0.0,0.0,0.0,s2acc*pow(deltaT,4),s2acc*pow(deltaT,3),0.0,
+               0.0,0.0,0.0,s2acc*pow(deltaT,3),s2acc*pow(deltaT,2),0.0,
+               0.0,0.0,0.0,0.0,0.0,1.0E-12};
 
-        // Check if we've read a full NMEA sentence into TinyGPS, then we're gonna do a GPS update on the filter
+        // Check if we've read a full NMEA sentence into TinyGPS, then we're gonna do a GPS update on the filter 
+        // i.e. update on GPS whenever it's availabe
         if (stringComplete) {
           stringComplete = false;
-          // If position is updates, calculate fix2fix heading and update lat/lon
+          // If position is updated, calculate fix2fix heading and update lat/lon
           if(gps.location.isUpdated()) {
+                //Serial.println("GPS UPDATE");
                 lat = gps.location.lat();
                 lon = gps.location.lng();
                 dist = TinyGPSPlus::distanceBetween(lat,lon,old_lat,old_lon);
@@ -236,19 +224,42 @@
                   old_lat = lat;
                   old_lon = lon;
                 }
-                // GPS update measurement matrix, unit conversion from km/h to m/s
+                // Set measurement matrix to GPS update matrix, unit conversion from km/h to m/s for speed
+                // ADD STUFF FOR NEGATIVE SPEED HERE
                 K.H = {1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                       0.0, 0.0, 0.0, 3.6, 0.0, 0.0};
+                // Set measurement uncertainty for GPS
+                K.R = {rGPS,   0.0,
+                       0.0,   rGPS};
+
+                // Observations and control variable update from sensors
+                obs(0) = heading/CONST_180_DIVIDED_BY_PI;
+                obs(1) = atof(speedGPS.value());
+                ctrl(0) = pitchRate;     
+                
+                //Serial << obs << ctrl << '\n';
           }
         } 
-        // Here we do the IMU update
+        // Here we do the IMU update whenever there's no fresh GPS data
         else {
-              // IMU measurement matrix
+              //Serial.println("IMU UPDATE");
+              // Set measurement matrix to IMU update matrix
               K.H = {0.0, 1.0, -1.0, 0.0, 0.0, 0.0,
                      0.0, 0.0, 0.0, 0.0, 1.0, -1.0};
-     
+              // Set measurement uncertainty for IMU
+              K.R = {rIMU,   0.0,
+                       0.0,   rIMU};
+
+              // Observations and control variable update from sensors
+              obs(0) = yawRate;
+              obs(1) = xAcc;
+              ctrl(0) = pitchRate;
         }
 
+        // Run the filter step
+        K.update(obs,ctrl);
+
+        /*
         // Dump data to Serial 1 (USB) for testing / saving
         Serial.print(lat,12);
         Serial.print(",");
@@ -271,6 +282,8 @@
         Serial.print(bno08xPitch,8);
         Serial.print(",");
         Serial.println(xAcc,8);
+        */
+        Serial << K.x << '\n';
       }
     }
 
@@ -287,7 +300,7 @@
     //Serial.println();
     //Serial.flush();
 
-    //10 hz
+    //100 hz
     delay(REPORT_INTERVAL);                           
   }
 
