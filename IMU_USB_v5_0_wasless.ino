@@ -1,6 +1,7 @@
  /*      
-  * USB IMU code for For AgOpenGPS
+  * WASless IMU + GPS fusieon code for For AgOpenGPS
   * 4 Feb 2021, Brian Tischler
+  * 18 Dec 2021, Juho Könnö
   * Like all Arduino code - copied from somewhere else :)
   * So don't claim it as your own
   */
