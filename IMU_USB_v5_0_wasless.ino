@@ -31,8 +31,15 @@
   double lon = 0.0;
   double dist = 0.0;
   double heading = 0.0;
+  double machineYawRate = 0.0;
   double wasAngle = 0.0;
-
+  double wheelBase = 2.76;
+  double wasSpeedLimit = 0.5;
+  double measuredGPSSpeed = 0.0;
+  double stabTimeCounter = 0.0;
+  double xAccAccumulated = 0.0;
+  double yawRateAccumulated = 0.0;
+  
   // Setup the Kalman filter variables
   #define Nstate 6 // heading, z-rate, z-bias, velocity, x-acc, x-bias
   #define Nobs 2   // heading, speed
@@ -52,9 +59,9 @@
   uint8_t data[] = {0x80,0x81,0x7D,0xD3,8, 0,0,0,0, 0,0,0,0, 15};
   int16_t dataSize = sizeof(data);
 
-  // booleans to see if we are using CMPS or BNO08x
-  bool useCMPS = false;
+  // booleans to see if we are using BNO08x and if we're in stabilize mode
   bool useBNO08x = false;
+  bool stabilizeMode = true;
 
   // BNO08x address variables to check where it is
   const uint8_t bno08xAddresses[] = {0x4A,0x4B};
@@ -111,7 +118,7 @@
           // Enable raw gyro data at double rate
           bno08x.enableGyro(REPORT_INTERVAL);
           // Enable gameRotationVector mode
-          bno08x.enableGameRotationVector(2*REPORT_INTERVAL); //Send data update every REPORT_INTERVAL in ms for BNO085, looks like this cannot be identical to the other reports for it to work...
+          bno08x.enableGameRotationVector(REPORT_INTERVAL); //Send data update every REPORT_INTERVAL in ms for BNO085, looks like this cannot be identical to the other reports for it to work...
           // Enable raw accelerometer
           bno08x.enableAccelerometer(REPORT_INTERVAL);
           delay(100);
@@ -226,7 +233,6 @@
                   old_lon = lon;
                 }
                 // Set measurement matrix to GPS update matrix, unit conversion from km/h to m/s for speed
-                // ADD STUFF FOR NEGATIVE SPEED HERE
                 K.H = {1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                       0.0, 0.0, 0.0, 3.6, 0.0, 0.0};
                 // Set measurement uncertainty for GPS
@@ -234,8 +240,28 @@
                        0.0,   rGPS};
 
                 // Observations and control variable update from sensors
-                obs(0) = heading/CONST_180_DIVIDED_BY_PI;
-                obs(1) = atof(speedGPS.value());
+                measuredGPSSpeed = atof(speedGPS.value());
+                
+                // Check for speed over WAS limit
+                if (measuredGPSSpeed > wasSpeedLimit) {
+                  // Use GPS heading
+                  obs(0) = heading/CONST_180_DIVIDED_BY_PI;
+                  // Check for direction of travel
+                  if (K.x(3) < 0) {
+                    // Reverse direction
+                    obs(1) = -measuredGPSSpeed;
+                  } else {
+                    // Forward direction
+                    obs(1) = measuredGPSSpeed;
+                  }
+                } else {
+                  // Use IMU heading
+                  obs(0) = bno08xHeading;
+                  // Below limit set speed to zero
+                  obs(1) = 0.0;
+                }
+
+                // Pitchrate for control vector
                 ctrl(0) = pitchRate;     
                 
                 //Serial << obs << ctrl << '\n';
@@ -256,9 +282,40 @@
               obs(1) = xAcc;
               ctrl(0) = pitchRate;
         }
+        
+        // Stabilize for 5 secs at startup
+        if (stabilizeMode) {
+          stabTimeCounter += deltaT;
+          xAccAccumulated += xAcc*deltaT;
+          yawRateAccumulated += yawRate*deltaT;
+          if (stabTimeCounter > 5.0){
+            stabilizeMode = false;
+            // Set initial biases
+            K.x(2) = -yawRateAccumulated/stabTimeCounter;
+            K.x(5) = -xAccAccumulated/stabTimeCounter;
+            Serial.print("Stabilization done, yaw bias: ");
+            Serial.print(K.x(2));
+            Serial.print(", acceleration bias: ");
+            Serial.println(K.x(5));
+          }
+        } else {
+          // Run the filter step
+          K.update(obs,ctrl);
 
-        // Run the filter step
-        K.update(obs,ctrl);
+          // Calculate true yaw rate in navigation frame
+          machineYawRate = (K.x(1)-K.x(2))*cos(bno08xRoll)/cos(bno08xPitch)+pitchRate*sin(bno08xRoll)/cos(bno08xPitch);
+
+          // Calculate virtual steering angle
+          // Check speed to avoid division by zero, set zero for now...
+          if (abs(K.x(3)) > wasSpeedLimit) {
+            wasAngle = atan(machineYawRate*wheelBase/K.x(3));
+          } else {
+            wasAngle = 0.0;
+          }
+          Serial.print(K.x(0)*CONST_180_DIVIDED_BY_PI);
+          Serial.print('\t'); 
+          Serial.println(wasAngle*CONST_180_DIVIDED_BY_PI);
+        }
 
         /*
         // Dump data to Serial 1 (USB) for testing / saving
@@ -284,7 +341,7 @@
         Serial.print(",");
         Serial.println(xAcc,8);
         */
-        Serial << K.x << '\n';
+
       }
     }
 
