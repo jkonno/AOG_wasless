@@ -66,8 +66,8 @@
   double deltaT; // delay between two updates of the filter
   double s2yaw = 0.49; // covariance for yaw, based on process noise 40m/s2 max accel.
   double s2acc = 10000; // covariance for acceleration based on 100 m/s^3 jerk
-  double rGPS = 0.0001; //GPS meas covariance
-  double rIMU = 0.01; //IMU meas covariance
+  //double rGPS = 0.0001; //GPS meas covariance
+  //double rIMU = 0.01; //IMU meas covariance
   int turnSwitch = 0;
 
   //CMPS PGN - 211
@@ -255,7 +255,7 @@
                 K.H = {1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                       0.0, 0.0, 0.0, 3.6, 0.0, 0.0};
                 // Set measurement uncertainty for GPS
-                K.R = {atan(0.05/(measuredGPSSpeed/3.6+0.1)),   0.0,
+                K.R = {pow(atan(0.05/(measuredGPSSpeed/3.6+0.1)),2),   0.0,
                        0.0,   0.025};
                 
                 // Observations and control variable update from sensors 
